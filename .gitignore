@@ -1,10 +1,9 @@
 # Python
 __pycache__/
 *.py[cod]
-*.so
 
 # Runtime cache
-.watchlist_cache.json
+.secids_cache.json
 
 # IDE
 .vscode/
