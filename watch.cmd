@@ -1,8 +1,3 @@
 @echo off
-where python >nul 2>nul
-if %errorlevel%==0 (
-    python "%~dp0watch_quotes.py" %*
-) else (
-    py -3 "%~dp0watch_quotes.py" %*
-)
+powershell -ExecutionPolicy Bypass -File "%~dp0watch_quotes.ps1" %*
 if errorlevel 1 pause
