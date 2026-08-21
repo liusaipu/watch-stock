@@ -30,7 +30,12 @@ from quotes_core import (
 
 
 def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    if os.name == 'nt':
+        os.system('cls')
+    else:
+        # 避免在缺少 TERM 的环境（如某些自动化终端）下 clear 命令挂起
+        print('\033[2J\033[H', end='')
+        sys.stdout.flush()
 
 
 def get_quotes():

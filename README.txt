@@ -3,12 +3,18 @@
 
 使用方法
 --------
+### Windows
 1. 双击 watch.cmd，默认 15 秒刷新，隐蔽模式
 2. 或命令行运行：watch.cmd [刷新秒数] [参数]
+
+### macOS / Linux
+1. 打开终端，进入项目目录
+2. 运行：./watch [刷新秒数] [参数]
 
 常用命令
 --------
   watch.cmd                    隐蔽模式，15秒刷新（办公推荐）
+  ./watch 5 --index on         macOS 下 5 秒刷新并显示指数方块
   watch.cmd 30                 隐蔽模式，30秒刷新
   watch.cmd --once             取一次数据后退出
   watch.cmd --stealth off --index on
@@ -48,8 +54,12 @@
 
 文件说明
 --------
-  watch.cmd            启动器（cmd 下运行）
-  watch_quotes.ps1     主程序（PowerShell）
+  watch.cmd            Windows 启动器（cmd 下运行）
+  watch                跨平台统一入口（macOS / Linux / Git Bash）
+  watch.sh             macOS / Linux 启动器（watch 的兼容备用）
+  watch_quotes.ps1     主程序（PowerShell，Windows 完整功能版）
+  watch_quotes.py      主程序（Python，macOS / Linux 版）
+  quotes_core.py       Python 版核心库
   watchlist.json       自选股配置
   .secids_cache.json        股票代码缓存（删除后会重新搜索）
   .hy_pct_cache.json        半年涨跌幅缓存（删除后会重新获取）
@@ -71,3 +81,10 @@
 - 修改 watchlist.json 可增删股票和指数
 - 首次运行如提示执行策略限制，请用 watch.cmd 启动
 - 若长时间频繁刷新仍被屏蔽，可适当加大刷新间隔（如 watch.cmd 60）
+
+macOS 特别说明
+--------------
+- 首次运行若提示 SSL 证书验证失败，程序会自动降级为不验证证书继续访问，
+  并打印一次警告。如需彻底解决，请运行 Python 安装目录下的
+  "Install Certificates.command"。
+- 在 macOS 终端中，./watch 与 ./watch.sh 等价，推荐使用 ./watch。

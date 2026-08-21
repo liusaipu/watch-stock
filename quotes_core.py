@@ -13,7 +13,12 @@
 
 import json
 import re
+import shutil
+import socket
+import ssl
+import subprocess
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 import os
@@ -48,9 +53,75 @@ MARKET_TOTAL_SECIDS = {
     'bj': '0.899050',   # 北证50   -> 北市
 }
 
+# ── 名称 -> secid 本地缓存（与 PowerShell 版共用 .secids_cache.json）────────
+_SECID_CACHE_FILE = os.path.join(BASE_DIR, '.secids_cache.json')
+_SECID_CACHE = None
+
+
+def _load_secid_cache():
+    """加载并返回名称到 secid 的本地缓存。"""
+    global _SECID_CACHE
+    if _SECID_CACHE is None:
+        try:
+            with open(_SECID_CACHE_FILE, 'r', encoding='utf-8') as f:
+                _SECID_CACHE = json.load(f)
+        except Exception:
+            _SECID_CACHE = {}
+    return _SECID_CACHE
+
+
+def _save_secid_cache():
+    """保存名称到 secid 的本地缓存。"""
+    try:
+        with open(_SECID_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(_SECID_CACHE or {}, f, ensure_ascii=False, indent=4)
+    except Exception:
+        pass
+
+
 # ── 上证/深证指数识别正则 ───────────────────────────────────
 _RE_SH_INDEX      = re.compile(r'^000(001|688)$')
 _RE_SZ_BJ_INDEX   = re.compile(r'^(399|899|930)\d{3}$')
+
+# ── SSL 证书降级标志（macOS 默认 Python 证书缺失时只警告一次）─────────
+_SSL_WARNED = False
+
+
+def _urlopen(req, timeout):
+    """封装 urlopen，macOS 证书验证失败时自动降级到不验证证书。"""
+    global _SSL_WARNED
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.URLError as e:
+            reason = getattr(e, 'reason', e)
+            if isinstance(reason, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(reason):
+                if not _SSL_WARNED:
+                    print('[warn] 系统 SSL 证书验证失败，尝试不验证证书继续访问...')
+                    _SSL_WARNED = True
+                ctx = ssl._create_unverified_context()
+                return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+            raise
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+
+def _fetch_text_curl(url, timeout=10):
+    """当 urllib 被服务端识别为异常流量时，用 curl 兜底取回文本。"""
+    if not shutil.which('curl'):
+        return None
+    try:
+        out = subprocess.check_output(
+            ['curl', '-s', '-L', '--max-time', str(timeout),
+             '-A', 'Mozilla/5.0', url],
+            stderr=subprocess.DEVNULL,
+            timeout=timeout + 2,
+        )
+        return out.decode('utf-8')
+    except Exception:
+        return None
 
 
 def fetch(url, timeout=15, retries=1, extra_headers=None):
@@ -64,7 +135,7 @@ def fetch(url, timeout=15, retries=1, extra_headers=None):
             if extra_headers:
                 headers.update(extra_headers)
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode('utf-8'))
         except Exception as e:
             last_err = e
@@ -167,7 +238,7 @@ def fetch_quotes_sina(secids, retries=1):
             req = urllib.request.Request(url, headers={
                 'Referer': 'https://finance.sina.com.cn/'
             })
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _urlopen(req, timeout=15) as resp:
                 # 使用 gbk 解码（gb2312 的超集，更安全）
                 text = resp.read().decode('gbk', errors='replace')
             return parse_sina_quote_response(text)
@@ -268,8 +339,18 @@ def search_secids(names, meta=None):
     Returns:
         secid 列表 (如 ['1.600519', '0.000001'])
     """
+    cache = _load_secid_cache()
     secids = []
+    need_save = False
     for name in names:
+        # 1) 先查本地缓存
+        cached_secid = cache.get(name)
+        if cached_secid:
+            secids.append(cached_secid)
+            continue
+
+        # 2) 缓存未命中再请求网络
+        items = []
         try:
             url = (
                 "https://searchapi.eastmoney.com/api/suggest/get?"
@@ -277,6 +358,21 @@ def search_secids(names, meta=None):
             )
             data = fetch(url, timeout=10)
             items = data.get('QuotationCodeTable', {}).get('Data', [])
+        except Exception as e:
+            # urllib 在某些环境会被服务端返回非行情数据，用 curl 兜底
+            try:
+                url = (
+                    "https://searchapi.eastmoney.com/api/suggest/get?"
+                    f"input={urllib.parse.quote(name)}&type=14&count=5"
+                )
+                text = _fetch_text_curl(url, timeout=10)
+                if text:
+                    data = json.loads(text)
+                    items = data.get('QuotationCodeTable', {}).get('Data', [])
+            except Exception:
+                print(f"[错误] 搜索 {name} 失败: {e}")
+                continue
+        try:
             item = None
             for it in items:
                 if it.get('Name') == name:
@@ -289,6 +385,8 @@ def search_secids(names, meta=None):
                 continue
             secid = item.get('QuoteID')
             secids.append(secid)
+            cache[name] = secid
+            need_save = True
             if meta is not None:
                 meta[secid] = {
                     'name': item.get('Name', name),
@@ -297,6 +395,8 @@ def search_secids(names, meta=None):
                 }
         except Exception as e:
             print(f"[错误] 搜索 {name} 失败: {e}")
+    if need_save:
+        _save_secid_cache()
     return secids
 
 
@@ -477,7 +577,7 @@ def fetch_depth_data(secid, retries=1):
             'Referer': 'https://finance.sina.com.cn/',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _urlopen(req, timeout=15) as resp:
             text = resp.read().decode('gbk', errors='replace')
         m = re.search(r'var hq_str_' + re.escape(sina_code) + r'="([^"]*)";', text)
         if m:

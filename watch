@@ -1,0 +1,14 @@
+#!/bin/sh
+# 股票行情监视器统一入口
+# macOS / Linux : 直接运行 Python 版本
+# Windows (Git Bash / MSYS2 / Cygwin) : 转交给 watch.cmd
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        exec "$SCRIPT_DIR/watch.cmd" "$@"
+        ;;
+esac
+
+exec python3 "$SCRIPT_DIR/watch_quotes.py" "$@"
