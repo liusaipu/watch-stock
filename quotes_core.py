@@ -11,12 +11,16 @@
   f17 = 今开         f18 = 昨收
 """
 
+import concurrent.futures
+import datetime
 import json
 import re
 import shutil
 import socket
 import ssl
 import subprocess
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -447,9 +451,9 @@ def fmt_open_price(open_val, prev_close_val, digits=2):
         o = float(open_val)
         p = float(prev_close_val)
         if o > p:
-            return price_str, '↑'
+            return price_str, '▲'
         elif o < p:
-            return price_str, '↓'
+            return price_str, '▼'
         else:
             return price_str, '-'
     except Exception:
@@ -665,20 +669,78 @@ def _limit_ratio_for_code(code, name=''):
     return 0.10
 
 
+_raw_fd = None
+_raw_old = None
+
+
+def enter_raw_mode():
+    """进入一次性 raw 模式，持续到 restore_terminal()。
+
+    macOS/Linux: 把终端切换为 raw 模式，关闭行缓冲与回显（ECHO/ICANON/ISIG）。
+    这样方向键/功能键的转义序列能被完整逐字节读取，也不会被终端回显成
+    诸如 ^[[B 之类的文本。交互期间只调用一次，避免反复切换导致按键丢失。
+
+    注意：仅关闭“输入侧”的标志（回显/行缓冲/信号），保留 OFLAG 里的
+    OPOST/ONLCR，使 print() 输出的 \\n 仍被终端转换为 \\r\\n，
+    否则整屏会因只换行不回车而呈阶梯状乱套。
+    """
+    global _raw_fd, _raw_old
+    if sys.platform == 'win32':
+        return
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        _raw_old = old
+        new = list(old)
+        # 注意：本 Python 的 termios 模块不导出 IFLAG/OFLAG/LFLAG/CC 下标常量，
+        # 只能按 tcgetattr 返回顺序用数字下标：0=iflag,1=oflag,3=lflag,6=cc。
+        # 输入侧：关闭回显、行缓冲、信号，且不做 \r->\n 转换/软件流控。
+        new[0] &= ~(termios.BRKINT | termios.ICRNL
+                    | termios.INPCK | termios.ISTRIP | termios.IXON)
+        new[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        # 输出侧保留 OPOST/ONLCR：print() 的 \n 必须转成 \r\n，
+        # 否则终端只换行不回车，整屏会呈阶梯状乱套。
+        new[1] |= termios.OPOST | termios.ONLCR
+        termios.tcsetattr(fd, termios.TCSAFLUSH, new)
+        _raw_fd = fd
+    except Exception:
+        _raw_fd = None
+        _raw_old = None
+
+
+def restore_terminal():
+    """退出交互时恢复终端原先的行模式/回显。"""
+    global _raw_fd, _raw_old
+    if sys.platform == 'win32' or _raw_fd is None:
+        return
+    try:
+        import termios
+        termios.tcsetattr(_raw_fd, termios.TCSADRAIN, _raw_old)
+    except Exception:
+        pass
+    finally:
+        _raw_fd = None
+        _raw_old = None
+
+
 def get_key(timeout=0.1):
     """跨平台非阻塞读取单个按键。
 
-    在 Windows 上使用 msvcrt，在 Unix 上使用 tty+termios+select。
+    在 Windows 上使用 msvcrt；在 Unix 上使用 select+os.read。
+    Unix 下调用前需先 enter_raw_mode() 进入 raw 模式（交互期间保持），
+    本函数不再反复切换终端模式，避免回显与转义序列被拆开误读。
 
     Args:
         timeout: 轮询超时（秒），仅在 Unix select 模式下生效
 
     Returns:
         str 或 None:
-            'UP', 'DOWN', 'LEFT', 'RIGHT', 'ENTER', 'ESC', 'R', 'r',
+            'UP', 'DOWN', 'LEFT', 'RIGHT', 'ENTER', 'ESC', 'F9', 'R', 'r',
             或 None（超时无输入）
     """
-    import sys
     if sys.platform == 'win32':
         import msvcrt
         if not msvcrt.kbhit():
@@ -698,33 +760,58 @@ def get_key(timeout=0.1):
         except Exception:
             return None
     else:
-        # Unix: read escape sequences
+        # Unix: 已由 enter_raw_mode() 保持 raw，直接读取字节
         import select
-        import tty
-        import termios
+
+        def _read_escape_tail(fd, wait=0.1):
+            """读取 ESC 之后的转义序列尾巴（最多 5 字节）。
+
+            读到一条完整可识别的序列（方向键 [A/B/C/D 或功能键 [20~）就停，
+            或遇到下一个 ESC 就停，避免连发的多条转义序列被混在一起误读。
+            """
+            out = ''
+            for _ in range(5):
+                r, _, _ = select.select([fd], [], [], wait)
+                if not r:
+                    break
+                c = os.read(fd, 1)
+                if not c:
+                    break
+                ch = c.decode('utf-8', errors='replace')
+                if ch == '\x1b':
+                    # 下一个转义序列开始，说明当前 ESC 已是独立按键
+                    break
+                out += ch
+                if out in ('[A', '[B', '[C', '[D', '[20~',
+                           'OA', 'OB', 'OC', 'OD'):
+                    break
+            return out
 
         fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            r, _, _ = select.select([sys.stdin], [], [], timeout)
-            if not r:
-                return None
-            ch = sys.stdin.read(1)
-            if ch == '\x1b':
-                r2, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if r2:
-                    ch2 = sys.stdin.read(1)
-                    if ch2 == '[':
-                        ch3 = sys.stdin.read(1)
-                        _arrow = {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}
-                        return _arrow.get(ch3)
-                return 'ESC'
-            if ch in ('\r', '\n'):
-                return 'ENTER'
-            return ch if len(ch) == 1 else None
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not r:
+            return None
+        ch = os.read(fd, 1)
+        if not ch:
+            return None
+        ch = ch.decode('utf-8', errors='replace')
+        if ch == '\x1b':
+            # 给终端一点时间来发送完整转义序列；单独一个 ESC 即为 Esc 键。
+            seq = _read_escape_tail(fd)
+            if seq[:1] in ('[', 'O'):
+                body = seq[1:]
+                _arrow = {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}
+                if body in _arrow:
+                    return _arrow[body]
+                # 功能键：F9 常见序列为 "20~"
+                if body == '20~':
+                    return 'F9'
+            return 'ESC'
+        if ch in ('\r', '\n'):
+            return 'ENTER'
+        if ch == '\x03':  # raw 模式下 Ctrl+C 不再触发 SIGINT，作为退出信号返回
+            return 'CTRL_C'
+        return ch if len(ch) == 1 else None
 
 
 def load_market_total_cache():
@@ -754,6 +841,147 @@ def get_market_total_cache():
     if _market_total_cache is None:
         _market_total_cache = load_market_total_cache()
     return _market_total_cache
+
+
+# ── 半年涨跌幅缓存 ──────────────────────────────────────────
+_HY_CACHE_FILE = os.path.join(BASE_DIR, '.hy_pct_cache.json')
+_HY_CACHE = None
+_hy_update_thread = None
+_hy_update_result = None
+
+
+def load_hy_cache():
+    """加载半年涨跌幅缓存。"""
+    global _HY_CACHE
+    if _HY_CACHE is None:
+        try:
+            with open(_HY_CACHE_FILE, 'r', encoding='utf-8') as f:
+                _HY_CACHE = json.load(f)
+        except Exception:
+            _HY_CACHE = {}
+    return _HY_CACHE
+
+
+def save_hy_cache():
+    """保存半年涨跌幅缓存。"""
+    try:
+        with open(_HY_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(_HY_CACHE or {}, f, ensure_ascii=False, indent=4)
+    except Exception:
+        pass
+
+
+def get_hy_cache():
+    """获取全局半年涨跌幅缓存对象。"""
+    global _HY_CACHE
+    if _HY_CACHE is None:
+        _HY_CACHE = load_hy_cache()
+    return _HY_CACHE
+
+
+def fetch_half_year_pct(secid):
+    """获取单只股票相对半年前的涨跌幅（%）。
+
+    使用东财日线接口，取最近一根 K 线往前约 6 个月的收盘价作对比。
+    """
+    url = (
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+        f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&"
+        "fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&"
+        "klt=101&fqt=0&end=20500101&lmt=200"
+    )
+    try:
+        data = fetch(url, timeout=15,
+                     extra_headers={'Referer': 'https://quote.eastmoney.com/'})
+        klines = data.get('data', {}).get('klines', [])
+        if not klines:
+            return None
+        latest = klines[-1].split(',')
+        if len(latest) < 3:
+            return None
+        latest_date = datetime.datetime.strptime(latest[0], '%Y-%m-%d').date()
+        target_date = latest_date - datetime.timedelta(days=180)
+        target_price = None
+        for k in klines:
+            parts = k.split(',')
+            if len(parts) < 3:
+                continue
+            d = datetime.datetime.strptime(parts[0], '%Y-%m-%d').date()
+            if d >= target_date:
+                target_price = float(parts[2])
+                break
+        current_price = float(latest[2])
+        if target_price is None or target_price == 0:
+            return None
+        return round((current_price - target_price) / target_price * 100, 2)
+    except Exception:
+        return None
+
+
+def _hy_worker(secids):
+    """后台线程：并发抓取半年涨跌幅。"""
+    result = {}
+    today = datetime.date.today().strftime('%Y-%m-%d')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        future_to_secid = {ex.submit(fetch_half_year_pct, s): s for s in secids}
+        for future in concurrent.futures.as_completed(future_to_secid):
+            secid = future_to_secid[future]
+            try:
+                pct = future.result()
+                if pct is not None:
+                    result[secid] = {'pct': pct, 'date': today}
+            except Exception:
+                pass
+    return result
+
+
+def start_half_year_update(secids):
+    """如尚未在更新且存在待更新 secid，则在后台启动半年涨跌抓取。"""
+    global _hy_update_thread, _hy_update_result
+    if _hy_update_thread is not None and _hy_update_thread.is_alive():
+        return
+    today = datetime.date.today().strftime('%Y-%m-%d')
+    need = []
+    cache = get_hy_cache()
+    for secid in secids:
+        cached = cache.get(secid)
+        if cached is None or cached.get('date') != today:
+            need.append(secid)
+    if not need:
+        return
+    _hy_update_result = None
+    _hy_update_thread = threading.Thread(target=lambda: _set_hy_result(need),
+                                         daemon=True)
+    _hy_update_thread.start()
+
+
+def _set_hy_result(secids):
+    """在线程中执行抓取并保存结果。"""
+    global _hy_update_result
+    _hy_update_result = _hy_worker(secids)
+
+
+def complete_half_year_update():
+    """将已完成的半年涨跌后台结果合并进缓存并落盘。"""
+    global _hy_update_thread, _hy_update_result
+    if _hy_update_thread is None:
+        return
+    if not _hy_update_thread.is_alive():
+        if _hy_update_result is not None:
+            cache = get_hy_cache()
+            cache.update(_hy_update_result)
+            save_hy_cache()
+        _hy_update_thread = None
+        _hy_update_result = None
+
+
+def apply_half_year_pct(rows):
+    """为行情行附加 'hyPct' 字段（来自缓存），无缓存则为 None。"""
+    cache = get_hy_cache()
+    for r in rows:
+        secid = f"{r.get(F_MARKET, '0')}.{r.get(F_CODE, '')}"
+        cached = cache.get(secid)
+        r['hyPct'] = cached.get('pct') if cached else None
 
 
 def fetch_index_kline_amounts(secid, days=20):

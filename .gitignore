@@ -4,6 +4,7 @@ __pycache__/
 
 # Runtime cache
 .secids_cache.json
+.hy_pct_cache.json
 .market_total_cache.json
 
 # IDE

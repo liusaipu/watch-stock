@@ -1,16 +1,19 @@
 """
-股票行情监视器（Python 版）
+股票行情监视器（Python 跨平台版）
 用法:
-  python watch_quotes.py [刷新秒数] [--index on|off] [--once] [-h]
+  python watch_quotes.py [刷新秒数] [--index on|off] [--stealth on|off] [--hy on|off] [--once] [-h]
 
 快捷键:
-  ↑/↓    移动光标选择股票
-  Enter  查看选中股票的盘口详情
-  R      立即刷新
-  C      按涨跌幅排序（第一次高到低，第二次低到高，第三次恢复）
-  V      按量比排序（第一次高到低，第二次低到高，第三次恢复）
-  Esc    退出或返回
-  Ctrl+C 强制退出
+  Esc        退出程序或返回上一层
+  R          立即刷新
+  C          按涨跌幅排序（第一次高到低，第二次低到高，第三次恢复）
+  V          按量比排序（第一次高到低，第二次低到高，第三次恢复）
+  S          切换简化模式 / 详情模式
+  B / F9     切换 npm 构建日志外观 / 正常行情
+  ↑ / ↓      移动光标（盘口页：切换上一只 / 下一只）
+  →          进入选中股票的盘口详情
+  ←          盘口页返回列表
+  Ctrl+C     强制退出
 """
 
 import json
@@ -24,21 +27,57 @@ from quotes_core import (
     F_VOL, F_AMT, F_TURNOVER, F_VOL_RATIO, F_HIGH, F_LOW, F_OPEN, F_PREV_CLOSE,
     F_TOTAL_CAP, F_FLOAT_CAP, F_LATEST_VOL,
     search_secids, fetch_quote_rows, get_key, truncate_name, is_etf,
-    fmt_num, fmt_open_price, display_width, pad_center, pad_left, pad_right,
-    print_indices, get_market_total_amounts, print_market_total, fetch_depth_data,
+    fmt_num, fmt_open_price, display_width, pad_left, pad_right,
+    get_market_total_amounts, fetch_depth_data,
+    enter_raw_mode, restore_terminal,
+    apply_half_year_pct, start_half_year_update, complete_half_year_update,
 )
 
 
-def clear_screen():
-    if os.name == 'nt':
-        os.system('cls')
-    else:
-        # 避免在缺少 TERM 的环境（如某些自动化终端）下 clear 命令挂起
-        print('\033[2J\033[H', end='')
+# ── ANSI 颜色/控制 ──────────────────────────────────────────
+_C_RESET = '\033[0m'
+_C_RED = '\033[91m'
+_C_GREEN = '\033[92m'
+_C_WHITE = '\033[97m'
+_C_GRAY = '\033[90m'
+_C_BLACK_BG = '\033[40m'
+_C_DARKGRAY_BG = '\033[100m'
+_C_HIDE_CURSOR = '\033[?25l'
+_C_SHOW_CURSOR = '\033[?25h'
+
+
+def _color(s, c):
+    return f'{c}{s}{_C_RESET}'
+
+
+def _set_title(title):
+    """通过 ANSI OSC 序列设置终端窗口标题。"""
+    try:
+        print(f'\033]0;{title}\007', end='')
         sys.stdout.flush()
+    except Exception:
+        pass
 
 
-def get_quotes():
+def clear_screen():
+    """清屏并把光标移到左上角。"""
+    print('\033[2J\033[H', end='')
+    sys.stdout.flush()
+
+
+def hide_cursor():
+    print(_C_HIDE_CURSOR, end='')
+    sys.stdout.flush()
+
+
+def show_cursor():
+    print(_C_SHOW_CURSOR, end='')
+    sys.stdout.flush()
+
+
+# ── 行情获取 ────────────────────────────────────────────────
+def get_quotes(fetch_hy=False):
+    """读取自选股并拉取行情，可选地触发半年涨跌后台更新。"""
     wl_path = os.path.join(BASE_DIR, 'watchlist.json')
     with open(wl_path, 'r', encoding='utf-8') as f:
         wl = json.load(f)
@@ -49,39 +88,224 @@ def get_quotes():
     index_secids = search_secids(indices)
 
     if not stock_secids and not index_secids:
-        return None, None, None, '没有可查询的股票或指数'
+        return None, None, '没有可查询的股票或指数'
 
-    stock_rows = fetch_quote_rows(stock_secids)
-    index_rows = fetch_quote_rows(index_secids)
-    return stock_rows, index_rows, None, None
+    all_secids = stock_secids + index_secids
+    rows = fetch_quote_rows(all_secids)
+
+    stock_rows = []
+    index_rows = []
+    index_set = set(index_secids)
+    for r in rows:
+        secid = f"{r.get(F_MARKET, '0')}.{r.get(F_CODE, '')}"
+        if secid in index_set:
+            index_rows.append(r)
+        else:
+            stock_rows.append(r)
+
+    if fetch_hy and stock_secids:
+        start_half_year_update(stock_secids)
+
+    return stock_rows, index_rows, None
 
 
-def _fmt_row(r):
-    """格式化单个股票行为字符串。"""
+# ── 列表格式化 ──────────────────────────────────────────────
+def _fmt_row_stealth(r):
+    """简化模式单行格式化（与 PowerShell 版字段/顺序/宽度一致）。"""
+    digits = 3 if is_etf(r) else 2
     code = r.get(F_CODE, '')
     name = truncate_name(r.get(F_NAME, ''))
-    market = '深A' if str(r.get(F_MARKET, '')) == '0' else '沪A'
-    price_digits = 3 if is_etf(r) else 2
-    price = fmt_num(r.get(F_PRICE), digits=price_digits)
-    prev_close = fmt_num(r.get(F_PREV_CLOSE), digits=price_digits)
-    open_price, open_arrow = fmt_open_price(
-        r.get(F_OPEN), r.get(F_PREV_CLOSE), digits=price_digits
-    )
-    high = fmt_num(r.get(F_HIGH), digits=price_digits)
-    low = fmt_num(r.get(F_LOW), digits=price_digits)
-    change = fmt_num(r.get(F_CHG), digits=price_digits)
     pct = fmt_num(r.get(F_PCT_CHG))
-    turnover = fmt_num(r.get(F_TURNOVER))
+    change = fmt_num(r.get(F_CHG), digits=digits)
+    price = fmt_num(r.get(F_PRICE), digits=digits)
     vr = fmt_num(r.get(F_VOL_RATIO))
-    vol = fmt_num(r.get(F_VOL), digits=0)
-    amt = fmt_num(r.get(F_AMT), divisor=100000000)
+    turnover = fmt_num(r.get(F_TURNOVER))
     return (
-        f"{name:<10} {code:<8} {market:<5} {price:>8} {prev_close:>8} "
-        f"{open_price:>8}{open_arrow} {high:>8} {low:>8} {change:>9} "
-        f"{pct:>8}% {turnover:>8} {vr:>8} {vol:>12} {amt:>9}"
+        f"{pad_left(code, 7)} {pad_right(name, 8)} "
+        f"{pad_left(f'{pct}%', 9)} {pad_left(change, 9)} "
+        f"{pad_left(price, 8)} {pad_left(vr, 8)} {pad_left(turnover, 8)}"
     )
 
 
+def _fmt_row_normal(r):
+    """详情模式单行格式化（与 PowerShell 版字段/顺序/宽度一致）。"""
+    digits = 3 if is_etf(r) else 2
+    code = r.get(F_CODE, '')
+    name = truncate_name(r.get(F_NAME, ''))
+    pct = fmt_num(r.get(F_PCT_CHG))
+    change = fmt_num(r.get(F_CHG), digits=digits)
+    price = fmt_num(r.get(F_PRICE), digits=digits)
+    prev_close = fmt_num(r.get(F_PREV_CLOSE), digits=digits)
+    open_price, open_arrow = fmt_open_price(r.get(F_OPEN), r.get(F_PREV_CLOSE), digits=digits)
+    high = fmt_num(r.get(F_HIGH), digits=digits)
+    low = fmt_num(r.get(F_LOW), digits=digits)
+    vr = fmt_num(r.get(F_VOL_RATIO))
+    turnover = fmt_num(r.get(F_TURNOVER))
+    amount = fmt_num(r.get(F_AMT), divisor=100000000)
+    hy_pct = fmt_num(r.get('hyPct'))
+    return (
+        f"{pad_left(code, 7)} {pad_right(name, 8)} "
+        f"{pad_left(f'{pct}%', 9)} {pad_left(change, 9)} "
+        f"{pad_left(price, 8)} {pad_left(prev_close, 8)} {pad_left(open_price, 8)}{open_arrow} "
+        f"{pad_left(high, 8)} {pad_left(low, 8)} {pad_left(vr, 8)} "
+        f"{pad_left(turnover, 8)} {pad_left(amount, 9)} {pad_left(f'{hy_pct}%', 10)}"
+    )
+
+
+def print_stocks(rows, stealth, highlight_idx=-1):
+    """打印自选股列表。"""
+    if stealth:
+        header = (
+            ' ' + pad_left('Code', 7) + ' ' + pad_right('Name', 8) + ' ' +
+            pad_left('Chg%', 9) + ' ' + pad_left('Chg', 9) + ' ' +
+            pad_left('Last', 8) + ' ' + pad_left('VolR', 8) + ' ' + pad_left('Turn%', 8)
+        )
+        width = 64
+        print(_color(header, _C_WHITE))
+        print(_color('-' * width, _C_WHITE))
+        for i, r in enumerate(rows):
+            prefix = '>' if i == highlight_idx else ' '
+            line = prefix + _fmt_row_stealth(r)
+            print(_color(line, _C_WHITE))
+    else:
+        header = (
+            ' ' + pad_left('代码', 7) + ' ' + pad_right('名称', 8) + ' ' +
+            pad_left('涨跌幅', 9) + ' ' + pad_left('涨跌额', 9) + ' ' +
+            pad_left('最新', 8) + ' ' + pad_left('昨收', 8) + ' ' + pad_left('今开', 9) + ' ' +
+            pad_left('最高', 8) + ' ' + pad_left('最低', 8) + ' ' + pad_left('量比', 8) + ' ' +
+            pad_left('换手%', 8) + ' ' + pad_left('成交额', 9) + ' ' + pad_left('半年涨跌', 10)
+        )
+        width = 122
+        print(header)
+        print('-' * width)
+        for i, r in enumerate(rows):
+            prefix = '>' if i == highlight_idx else ' '
+            line = prefix + _fmt_row_normal(r)
+            # 与 Windows 版一致：白字 + 隔行 黑/深灰 背景铺满整行
+            pad = width - display_width(line)
+            if pad > 0:
+                line += ' ' * pad
+            bg = _C_BLACK_BG if i % 2 == 0 else _C_DARKGRAY_BG
+            print(f'{_C_WHITE}{bg}{line}{_C_RESET}')
+
+
+def print_quotes(stock_rows, index_rows, show_index, stealth, highlight_idx=-1):
+    """打印完整行情页。"""
+    now = time.strftime('%H:%M:%S')
+    if stealth:
+        print(_color(f'System Monitor  |  Last update: {now} (Refresh: {interval}s)', _C_WHITE))
+    else:
+        print(f"自选股行情 ({len(stock_rows)} 只)    刷新时间: {now} ({interval} 秒自动刷新)")
+
+    if stock_rows:
+        print_stocks(stock_rows, stealth, highlight_idx=highlight_idx)
+
+    rows_to_show = []
+    if stealth:
+        rows_to_show = [r for r in index_rows if r.get(F_NAME) in ('上证指数', '深证成指')]
+    elif show_index:
+        rows_to_show = index_rows
+
+    if rows_to_show:
+        print_index_rows(rows_to_show, stealth)
+        market_info = get_market_total_amounts(index_rows)
+        print_market_total_row(market_info, stealth)
+
+
+def print_index_rows(rows, stealth):
+    """打印指数行情。"""
+    if not rows:
+        return
+    if stealth:
+        width = 64
+        print(_color('-' * width, _C_WHITE))
+        for r in rows:
+            name = truncate_name(r.get(F_NAME, ''))
+            price = fmt_num(r.get(F_PRICE))
+            change = fmt_num(r.get(F_CHG))
+            pct = fmt_num(r.get(F_PCT_CHG))
+            right = f'{change} / {pct}%'
+            line = pad_right(name, 8) + ' ' + pad_left(price, 10) + ' ' + pad_left(right, 20)
+            print(_color(line, _C_WHITE))
+        return
+
+    width = 122
+    print('-' * width)
+    per_row = 5
+    sep = ' │ '
+    sep_w = display_width(sep)
+    boxes = []
+    min_box_w = 0
+    for r in rows:
+        name = truncate_name(r.get(F_NAME, ''))
+        price = fmt_num(r.get(F_PRICE))
+        change = fmt_num(r.get(F_CHG))
+        pct = fmt_num(r.get(F_PCT_CHG))
+        right2 = f'{change} / {pct}%'
+        boxes.append((name, price, right2))
+        min_box_w = max(
+            min_box_w,
+            display_width(name) + display_width(price),
+            display_width(right2),
+        )
+    box_w = (width - (per_row - 1) * sep_w) // per_row
+    if box_w < min_box_w:
+        box_w = min_box_w
+
+    def fmt_top(name, price):
+        pad = box_w - display_width(name) - display_width(price)
+        if pad < 0:
+            pad = 0
+        return name + ' ' * pad + price
+
+    def fmt_bottom(right2):
+        pad = box_w - display_width(right2)
+        if pad < 0:
+            pad = 0
+        return ' ' * pad + right2
+
+    for i in range(0, len(boxes), per_row):
+        parts1 = []
+        parts2 = []
+        for j in range(per_row):
+            if i + j >= len(boxes):
+                break
+            name, price, right2 = boxes[i + j]
+            parts1.append(fmt_top(name, price))
+            parts2.append(fmt_bottom(right2))
+        line1 = sep.join(parts1)
+        line2 = sep.join(parts2)
+        pad = width - display_width(line1)
+        if pad > 0:
+            line1 += ' ' * pad
+        pad = width - display_width(line2)
+        if pad > 0:
+            line2 += ' ' * pad
+        print(line1)
+        print(line2)
+
+
+def print_market_total_row(info, stealth):
+    """打印三市成交总额与量比。"""
+    if not info or info.get('total_yi') is None or info.get('ratio') is None:
+        return
+    width = 64 if stealth else 122
+    label = '三市总额/量比 '
+    value = f"{info['total_yi']} / {info['ratio']}"
+    if stealth:
+        # 让斜杠与简化模式指数行的 "change / pct%" 对齐（斜杠前占 32 显示宽度）
+        target_slash_pos = 32
+        amount_str = str(info['total_yi'])
+        spaces_needed = target_slash_pos - display_width(label) - display_width(amount_str)
+        if spaces_needed < 0:
+            spaces_needed = 0
+        line = label + ' ' * spaces_needed + value
+        print(_color(pad_right(line, width), _C_WHITE))
+    else:
+        print(pad_right(label + value, width))
+
+
+# ── 排序 ────────────────────────────────────────────────────
 def _numeric_key(v):
     try:
         return float(v)
@@ -107,109 +331,65 @@ def apply_sort(rows, sort_state):
         return v
 
     return sorted(rows, key=key, reverse=reverse)
-
-
-def sort_hint(sort_state):
-    """返回当前排序状态提示文本。"""
-    parts = []
-    if sort_state['c'] == 1:
-        parts.append('C=涨跌幅↓')
-    elif sort_state['c'] == 2:
-        parts.append('C=涨跌幅↑')
-    if sort_state['v'] == 1:
-        parts.append('V=量比↓')
-    elif sort_state['v'] == 2:
-        parts.append('V=量比↑')
-    return ' '.join(parts)
-
-
-def print_stocks(rows, highlight_idx=-1):
-    """打印自选股列表，支持光标高亮。"""
-    header = (
-        f"{'名称':<10} {'代码':<8} {'市场':<5} {'最新':>8} {'昨收':>8} {'今开':>9} "
-        f"{'最高':>8} {'最低':>8} {'涨跌额':>9} {'涨跌幅':>8} {'换手%':>8} {'量比':>8} "
-        f"{'成交量(手)':>12} {'成交亿':>9}"
-    )
-    print(header)
-    print('-' * 132)
-    for i, r in enumerate(rows):
-        prefix = '> ' if i == highlight_idx else '  '
-        print(prefix + _fmt_row(r))
-
-
-def print_quotes(stock_rows, index_rows, show_index=True, highlight_idx=-1):
-    now = time.strftime('%Y-%m-%d %H:%M:%S')
-    print(f"自选股行情 ({len(stock_rows)} 只)    刷新时间: {now}")
-    if stock_rows:
-        print_stocks(stock_rows, highlight_idx=highlight_idx)
-    if show_index and index_rows:
-        print_indices(index_rows)
-        market_info = get_market_total_amounts(index_rows)
-        print_market_total(market_info)
-
-
+# ── 盘口详情 ────────────────────────────────────────────────
 def _fmt_yi(v):
-    """把金额格式化为 亿，返回纯数值（单位在标签中）。"""
     try:
-        return f"{float(v)/1e8:.2f}"
+        return f'{float(v) / 1e8:.2f}'
     except (TypeError, ValueError):
         return '-'
 
 
 def _fmt_wanyi(v):
-    """把市值格式化为 万亿，返回纯数值（单位在标签中）。"""
     try:
-        return f"{float(v)/1e12:.2f}"
-    except (TypeError, ValueError):
-        return '-'
-
-
-def _fmt_depth_price(v, digits=2):
-    return fmt_num(v, digits=digits)
-
-
-def _fmt_depth_vol(v):
-    try:
-        return f"{int(v):,}"
+        return f'{float(v) / 1e12:.2f}'
     except (TypeError, ValueError):
         return '-'
 
 
 def _fmt_latest_vol(v):
     try:
-        return f"{abs(int(float(v))):,}"
+        return f'{abs(int(float(v))):,}'
     except (TypeError, ValueError):
         return '-'
 
 
 def _row_to_secid(row):
-    """把行情行转换为东方财富 secid。"""
     market = str(row.get(F_MARKET, '0'))
     code = row.get(F_CODE, '')
-    return f"{market}.{code}"
+    return f'{market}.{code}'
+
+
+def _limit_ratio_for_code(code, name=''):
+    """根据股票代码和名称返回涨跌停限制比例（与 Windows 版一致）。"""
+    code = str(code)
+    name = str(name).upper()
+    if 'ST' in name:
+        return 0.05
+    if code.startswith('688') or code.startswith('300') or code.startswith('301'):
+        return 0.20
+    if code.startswith('8') or code.startswith('4'):
+        return 0.30
+    return 0.10
 
 
 def _left_line(label, value, width=20):
-    """左侧信息行：标签左对齐、数值右对齐，总显示宽度固定。"""
     label = str(label)
     value = str(value)
     label_w = display_width(label)
     value_w = display_width(value)
-    # 标签占 6 显示宽度（3 个汉字），数值占 14 显示宽度
     label_pad = label + ' ' * max(0, 6 - label_w)
     value_pad = ' ' * max(0, 14 - value_w) + value
     return label_pad + ' ' + value_pad
 
 
 def _right_line(label, price, vol):
-    """右侧盘口行：档位左对齐，价格和数量右对齐。"""
     label = str(label)
     price = str(price)
     vol = str(vol)
     label_pad = label + ' ' * max(0, 4 - display_width(label))
     price_pad = ' ' * max(0, 10 - display_width(price)) + price
     vol_pad = ' ' * max(0, 12 - display_width(vol)) + vol
-    return f"{label_pad} {price_pad} {vol_pad}"
+    return f'{label_pad} {price_pad} {vol_pad}'
 
 
 def _fmt_depth_title(depth, row):
@@ -222,22 +402,32 @@ def _fmt_depth_title(depth, row):
     pct = fmt_num(depth.get('pct_chg') or row.get(F_PCT_CHG))
     try:
         c = float(depth.get('change') if depth.get('change') is not None else row.get(F_CHG))
-        arrow = '▲' if c > 0 else '▼' if c < 0 else '─'
+        if c > 0:
+            arrow = '▲'
+            header_color = _C_RED
+        elif c < 0:
+            arrow = '▼'
+            header_color = _C_GREEN
+        else:
+            arrow = '─'
+            header_color = _C_WHITE
     except (TypeError, ValueError):
         arrow = '─'
+        header_color = _C_WHITE
     name_pad = pad_right(name, 8)
     code_pad = pad_right(code, 6)
     price_part = price + ' ' + arrow
     price_part_padded = price_part + ' ' * (12 - display_width(price_part))
     change_pad = change + ' ' * (9 - display_width(change))
     pct_part = pct + '%'
-    return f"{name_pad}    {code_pad}        {price_part_padded}{change_pad}{pct_part}"
+    title = f'{name_pad}    {code_pad}        {price_part_padded}{change_pad}{pct_part}'
+    return _color(title, header_color)
 
 
-def print_depth(depth, row):
-    """打印单只股票盘口详情窗口。"""
+def print_depth(depth, row, stealth=False):
+    """打印单只股票盘口详情窗口（与 Windows 版字段/顺序一致）。"""
     if not depth:
-        print("盘口数据获取失败")
+        print('盘口数据获取失败')
         return
 
     print(_fmt_depth_title(depth, row))
@@ -248,8 +438,21 @@ def print_depth(depth, row):
     open_price = fmt_num(depth.get('open'), digits=price_digits)
     high = fmt_num(depth.get('high'), digits=price_digits)
     low = fmt_num(depth.get('low'), digits=price_digits)
-    limit_up = fmt_num(depth.get('limit_up'), digits=price_digits)
-    limit_down = fmt_num(depth.get('limit_down'), digits=price_digits)
+
+    # 涨停跌停按 Windows 版规则手动计算（ETF 不显示）
+    name = depth.get('name') or row.get(F_NAME, '')
+    code = depth.get('code') or row.get(F_CODE, '')
+    is_etf_flag = 'ETF' in str(name).upper()
+    limit_up = '-'
+    limit_down = '-'
+    if (not is_etf_flag and depth.get('prev_close') is not None
+            and depth.get('prev_close') != 0):
+        ratio = _limit_ratio_for_code(code, name)
+        try:
+            limit_up = fmt_num(round(depth['prev_close'] * (1 + ratio), 2), digits=price_digits)
+            limit_down = fmt_num(round(depth['prev_close'] * (1 - ratio), 2), digits=price_digits)
+        except Exception:
+            pass
 
     turnover = fmt_num(row.get(F_TURNOVER))
     vol_ratio = fmt_num(row.get(F_VOL_RATIO))
@@ -259,6 +462,7 @@ def print_depth(depth, row):
     latest_vol = _fmt_latest_vol(row.get(F_LATEST_VOL))
 
     main_sep = '-' * 53
+    right_sep = '-' * 28
     print(main_sep)
 
     left_lines = [
@@ -279,37 +483,56 @@ def print_depth(depth, row):
     bids = depth.get('bids', [])
     right_lines = []
     for i in range(5, 0, -1):
-        price, vol = asks[5 - i] if len(asks) >= i else (None, None)
-        right_lines.append(
-            _right_line(f"卖{i}", _fmt_depth_price(price), _fmt_depth_vol(vol))
-        )
-    right_lines.append('-' * 28)
+        p, v = asks[5 - i] if len(asks) >= i else (None, None)
+        right_lines.append(_right_line(f'卖{i}', fmt_num(p, digits=price_digits), fmt_num(v, digits=0)))
+    right_lines.append(right_sep)
     for i in range(1, 6):
-        price, vol = bids[i - 1] if len(bids) >= i else (None, None)
-        right_lines.append(
-            _right_line(f"买{i}", _fmt_depth_price(price), _fmt_depth_vol(vol))
-        )
+        p, v = bids[i - 1] if len(bids) >= i else (None, None)
+        right_lines.append(_right_line(f'买{i}', fmt_num(p, digits=price_digits), fmt_num(v, digits=0)))
 
     for i in range(len(left_lines)):
         left = left_lines[i]
         right = right_lines[i] if i < len(right_lines) else ''
-        print(f"{left}    {right}")
+        print(f'{left}    {right}')
 
     print(main_sep)
-    print(_left_line('市值', total_cap + '万亿') + '        ' + _left_line('流通', float_cap + '亿'))
+    cap_line = (
+        _left_line('市值', total_cap + '万亿') + '        ' +
+        _left_line('流通', float_cap + '亿')
+    )
+    print(cap_line)
     print()
-    print("[Enter/Esc 返回  R 刷新]")
+    if stealth:
+        print(_color('[R refresh  ↑↓ switch  ← back]', _C_WHITE))
+    else:
+        print('[R 刷新  ↑↓ 切换  ← 返回]')
 
 
+# ── Boss 模式 ───────────────────────────────────────────────
+def show_boss_screen():
+    """显示伪装 npm 构建日志。"""
+    t = time.strftime('%H:%M:%S')
+    print(_color('> npm run build', _C_GRAY))
+    print()
+    print(_color('> project@1.0.0 build D:\\project', _C_GRAY))
+    print(_color('> tsc && vite build', _C_GRAY))
+    print()
+    print(_color('vite v5.0.0 building for production...', _C_GRAY))
+    print(_color('✓ 128 modules transformed.', _C_GRAY))
+    print(_color('dist/index.html                   0.45 kB', _C_GRAY))
+    print(_color('dist/assets/index-a1b2c3d4.js   142.31 kB', _C_GRAY))
+    print(_color('✓ built in 3.42s', _C_GRAY))
+    print()
+    print(_color(f'[{t}] Watching for changes...', _C_GRAY))
+
+
+# ── 按键轮询 ────────────────────────────────────────────────
 def wait_for_key_or_timeout(interval):
-    """轮询等待 interval 秒或直到有按键，返回按键字符串或 None。
-
-    以 0.1 秒为粒度轮询，既保证响应速度又不过分消耗 CPU。
-    """
+    """轮询等待按键，返回按键字符串或 None。"""
     elapsed = 0.0
-    step = 0.1
+    step = 0.05
     while elapsed < interval:
-        key = get_key()
+        key = get_key(timeout=step)
         if key is not None:
             return key
         time.sleep(step)
@@ -317,25 +540,69 @@ def wait_for_key_or_timeout(interval):
     return None
 
 
-def main():
-    if '--help' in sys.argv or '-h' in sys.argv:
-        print_help()
-        return
+# ── 按钮栏（文本提示） ─────────────────────────────────────
+def show_button_bar(stealth, depth_mode=False):
+    """在屏幕底部显示可用按键提示。"""
+    if depth_mode:
+        buttons = [
+            ('R', 'R refresh', 'R 刷新'),
+            ('↑↓', '↑↓ switch', '↑↓ 切换'),
+            ('←', '← back', '← 返回'),
+        ]
+    else:
+        buttons = [
+            ('R', 'R refresh', 'R 刷新'),
+            ('C', 'C sort%', 'C 涨跌幅排序'),
+            ('V', 'V sortVR', 'V 量比排序'),
+            ('B', 'B hide', 'B 伪装'),
+            ('S', 'S mode', 'S 切换'),
+            ('Esc', 'Esc exit', 'Esc 退出'),
+        ]
+    parts = []
+    for key, stealth_label, normal_label in buttons:
+        label = stealth_label if stealth else normal_label
+        parts.append(f'[{label}]')
+    bar = ' '.join(parts)
+    if stealth:
+        print(_color(bar, _C_WHITE))
+    else:
+        print(bar)
 
-    interval = 3
-    show_index = True
+
+# ── 主程序 ──────────────────────────────────────────────────
+def parse_args(argv):
+    """解析命令行参数，返回 (interval, show_index, stealth, fetch_hy, once)。"""
+    interval = 15
+    show_index = False
+    stealth = True
+    fetch_hy = False
     once = False
     i = 1
-    while i < len(sys.argv):
-        arg = sys.argv[i]
+    while i < len(argv):
+        arg = argv[i]
         if arg in ('--index', '-index'):
             i += 1
-            if i < len(sys.argv) and sys.argv[i].lower() in ('on', 'true', '1'):
+            if i < len(argv) and argv[i].lower() in ('on', 'true', '1'):
                 show_index = True
             else:
                 show_index = False
+        elif arg in ('--stealth', '-stealth'):
+            i += 1
+            if i < len(argv) and argv[i].lower() in ('off', 'false', '0'):
+                stealth = False
+            else:
+                stealth = True
+        elif arg in ('--hy', '-hy'):
+            i += 1
+            if i < len(argv) and argv[i].lower() in ('on', 'true', '1'):
+                fetch_hy = True
+            else:
+                fetch_hy = False
         elif arg == '--once':
             once = True
+        elif arg in ('--help', '-h'):
+            print_help()
+            sys.exit(0)
         else:
             try:
                 parsed = int(arg)
@@ -344,31 +611,72 @@ def main():
             except ValueError:
                 pass
         i += 1
+    return interval, show_index, stealth, fetch_hy, once
+
+
+def print_help(script_name='watch_quotes.py'):
+    print(f'用法: python {script_name} [刷新秒数] [--index on|off] [--stealth on|off] [--hy on|off] [--once] [-h]')
+    print()
+    print('参数:')
+    print('  刷新秒数          自动刷新间隔，默认 15 秒')
+    print('  --index on|off    是否显示指数方块，默认 off（详情模式）')
+    print('  --stealth on|off  简化模式（灰白英文、低调标题），默认 on')
+    print('  --hy on|off       启动时获取并缓存半年涨跌，默认 off')
+    print('  --once            只取一次数据后退出')
+    print('  -h, --help        显示此帮助信息')
+    print()
+    print('列表页快捷键:')
+    print('  Esc        退出程序')
+    print('  R          立即刷新行情')
+    print('  C          按涨跌幅排序（高→低→低→高→原样）')
+    print('  V          按量比排序（高→低→低→高→原样）')
+    print('  S          切换简化模式 / 详情模式')
+    print('  B / F9     切换 npm 构建日志外观 / 正常行情')
+    print('  ↑ / ↓      移动光标选择股票')
+    print('  →          进入选中股票的盘口详情')
+    print()
+    print('盘口详情页快捷键:')
+    print('  R          刷新盘口')
+    print('  ↑ / ↓      切换到上一只 / 下一只自选股盘口')
+    print('  ← / Esc    返回列表')
+    print('  Ctrl+C     强制退出')
+
+
+def main():
+    global interval
+    interval, show_index, stealth, fetch_hy, once = parse_args(sys.argv)
 
     if once:
-        stock_rows, index_rows, err, _ = get_quotes()
+        stock_rows, index_rows, err = get_quotes(fetch_hy=fetch_hy)
         if err:
             print(err)
             sys.exit(1)
-        print_quotes(stock_rows, index_rows, show_index)
+        apply_half_year_pct(stock_rows)
+        print_quotes(stock_rows, index_rows, show_index, stealth)
         return
 
-    # ── 交互模式 ──
+    # 交互模式
+    _set_title('System' if stealth else '行情监控')
     stock_rows = []
     index_rows = []
-    sort_state = {'c': 0, 'v': 0}  # 0=原样, 1=从高到低, 2=从低到高
+    sort_state = {'c': 0, 'v': 0}
     selected_idx = 0
     in_depth = False
     current_depth = None
     current_depth_row = None
+    depth_stock_rows = None
+    depth_stock_index = None
+    boss_mode = False
+    next_hy_update = time.time()
 
     def refresh_list():
         nonlocal stock_rows, index_rows
-        s_rows, i_rows, err, _ = get_quotes()
+        s_rows, i_rows, err = get_quotes(fetch_hy=fetch_hy)
         if err:
             return False, err
         stock_rows = s_rows or []
         index_rows = i_rows or []
+        apply_half_year_pct(stock_rows)
         return True, None
 
     def refresh_depth():
@@ -381,32 +689,55 @@ def main():
             return False, '盘口数据获取失败'
         return True, None
 
+    def schedule_hy_update():
+        nonlocal next_hy_update
+        if not fetch_hy:
+            return
+        complete_half_year_update()
+        now = time.time()
+        if now >= next_hy_update:
+            secids = [f"{r.get(F_MARKET, '0')}.{r.get(F_CODE, '')}" for r in stock_rows]
+            start_half_year_update(secids)
+            next_hy_update = now + interval * 4
+
     clear_screen()
     try:
-        # 首次加载
+        hide_cursor()
+        enter_raw_mode()
         ok, err = refresh_list()
         if not ok:
             print(err)
             return
 
         while True:
-            clear_screen()
-            display_rows = apply_sort(stock_rows, sort_state)
-
-            if in_depth:
-                print_depth(current_depth, current_depth_row)
+            if boss_mode:
+                clear_screen()
+                show_boss_screen()
             else:
-                if selected_idx >= len(display_rows):
-                    selected_idx = max(0, len(display_rows) - 1)
-                print_quotes(display_rows, index_rows, show_index, highlight_idx=selected_idx)
-                hint = sort_hint(sort_state)
-                print(f"\n[↑↓ 选择  Enter 盘口  R 刷新  C 涨跌幅  V 量比  Esc 退出] {hint}")
+                clear_screen()
+                display_rows = apply_sort(stock_rows, sort_state)
+                if in_depth:
+                    print_depth(current_depth, current_depth_row, stealth=stealth)
+                else:
+                    if selected_idx >= len(display_rows):
+                        selected_idx = max(0, len(display_rows) - 1)
+                    print_quotes(display_rows, index_rows, show_index, stealth, highlight_idx=selected_idx)
 
-            # 等待按键或超时
+                if not in_depth:
+                    print()
+                    show_button_bar(stealth, depth_mode=False)
+                else:
+                    # 盘口页底部提示已在 print_depth 中输出
+                    pass
+
+            schedule_hy_update()
+
             key = wait_for_key_or_timeout(interval)
 
             if key is None:
-                # 超时：自动刷新
+                # 超时自动刷新
+                if boss_mode:
+                    continue
                 if in_depth:
                     refresh_depth()
                 else:
@@ -422,19 +753,64 @@ def main():
                     in_depth = False
                     current_depth = None
                     current_depth_row = None
+                    depth_stock_rows = None
+                    depth_stock_index = None
+                elif boss_mode:
+                    boss_mode = False
                 else:
                     break
 
+            elif key == 'CTRL_C':
+                break
+
             elif key in ('r', 'R'):
+                if boss_mode:
+                    continue
                 if in_depth:
                     refresh_depth()
                 else:
                     ok, err = refresh_list()
+                    if not ok:
+                        clear_screen()
+                        print(err)
+                        time.sleep(1)
                 continue
 
-            elif key == 'ENTER':
-                if not in_depth and 0 <= selected_idx < len(display_rows):
+            elif key in ('b', 'B', 'F9'):
+                boss_mode = not boss_mode
+                continue
+
+            elif key in ('s', 'S'):
+                if boss_mode or in_depth:
+                    continue
+                stealth = not stealth
+                show_index = not show_index
+                _set_title('System' if stealth else '行情监控')
+                clear_screen()
+                continue
+
+            elif key in ('c', 'C'):
+                if boss_mode or in_depth:
+                    continue
+                sort_state['c'] = (sort_state['c'] + 1) % 3
+                sort_state['v'] = 0
+                continue
+
+            elif key in ('v', 'V'):
+                if boss_mode or in_depth:
+                    continue
+                sort_state['v'] = (sort_state['v'] + 1) % 3
+                sort_state['c'] = 0
+                continue
+
+            elif key == 'RIGHT':
+                if boss_mode or in_depth:
+                    continue
+                display_rows = apply_sort(stock_rows, sort_state)
+                if 0 <= selected_idx < len(display_rows):
                     current_depth_row = display_rows[selected_idx]
+                    depth_stock_rows = display_rows
+                    depth_stock_index = selected_idx
                     ok, err = refresh_depth()
                     if ok:
                         in_depth = True
@@ -442,50 +818,49 @@ def main():
                         clear_screen()
                         print(err)
                         time.sleep(1)
-                continue
+
+            elif key == 'LEFT':
+                if boss_mode:
+                    continue
+                if in_depth:
+                    in_depth = False
+                    current_depth = None
+                    current_depth_row = None
+                    depth_stock_rows = None
+                    depth_stock_index = None
 
             elif key == 'UP':
-                if not in_depth and selected_idx > 0:
-                    selected_idx -= 1
+                if boss_mode:
+                    continue
+                if in_depth:
+                    if depth_stock_rows and depth_stock_index is not None:
+                        depth_stock_index = (depth_stock_index - 1 + len(depth_stock_rows)) % len(depth_stock_rows)
+                        current_depth_row = depth_stock_rows[depth_stock_index]
+                        refresh_depth()
+                else:
+                    if stock_rows:
+                        selected_idx = (selected_idx - 1 + len(apply_sort(stock_rows, sort_state))) % len(apply_sort(stock_rows, sort_state))
 
             elif key == 'DOWN':
-                if not in_depth and selected_idx < len(display_rows) - 1:
-                    selected_idx += 1
-
-            elif key in ('c', 'C'):
-                if not in_depth:
-                    sort_state['c'] = (sort_state['c'] + 1) % 3
-                    sort_state['v'] = 0
-
-            elif key in ('v', 'V'):
-                if not in_depth:
-                    sort_state['v'] = (sort_state['v'] + 1) % 3
-                    sort_state['c'] = 0
+                if boss_mode:
+                    continue
+                if in_depth:
+                    if depth_stock_rows and depth_stock_index is not None:
+                        depth_stock_index = (depth_stock_index + 1) % len(depth_stock_rows)
+                        current_depth_row = depth_stock_rows[depth_stock_index]
+                        refresh_depth()
+                else:
+                    if stock_rows:
+                        selected_idx = (selected_idx + 1) % len(apply_sort(stock_rows, sort_state))
 
     except KeyboardInterrupt:
         pass
     finally:
+        show_cursor()
+        restore_terminal()
+        _set_title('')
         clear_screen()
-        print("已退出")
-
-
-def print_help(script_name='watch_quotes.py'):
-    print(f"用法: python {script_name} [刷新秒数] [--index on|off] [--once] [-h]")
-    print()
-    print("参数:")
-    print("  刷新秒数          自动刷新间隔，默认 3 秒")
-    print("  --index on|off    是否显示指数方块，默认 on")
-    print("  --once            只取一次数据后退出")
-    print("  -h, --help        显示此帮助信息")
-    print()
-    print("快捷键:")
-    print("  ↑/↓    移动光标选择股票")
-    print("  Enter  查看选中股票的盘口详情")
-    print("  R      立即刷新数据")
-    print("  C      按涨跌幅排序（第一次高到低，第二次低到高，第三次恢复）")
-    print("  V      按量比排序（第一次高到低，第二次低到高，第三次恢复）")
-    print("  Esc    退出程序或返回上一层")
-    print("  Ctrl+C 强制退出")
+        print('已退出')
 
 
 if __name__ == '__main__':
